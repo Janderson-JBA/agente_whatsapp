@@ -1,0 +1,24 @@
+# segurança
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Dados e logs dos testes...
+mensagens_log.txt
+blacklist.txt
+regras.txt
+*.log
+
+# Dependências e autenticação
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Configurações locais
+.vscode/
+.DS_Store

@@ -392,6 +392,7 @@ client.on('ready', () => {
 client.on('message', async (message) => {
     // No whatsapp-web.js, grupos terminam com '@g.us'
     const isGroupMsg = message.from.includes('@g.us');
+    const isBroadcastMsg = message.from.includes('@broadcast');
     const isNewsletterMsg = message.from.includes('@newsletter');
     const ignoredNumbers = carregarBlacklist();
     const isIgnoredNumber = estaNaBlacklist(message.from, ignoredNumbers);
@@ -403,6 +404,10 @@ client.on('message', async (message) => {
     // 6. Filtro rigoroso com explicações no terminal
     if (isGroupMsg) {
         registrarLog(`${logPrefix} [IGNORADO] Motivo: A mensagem veio de um grupo.`);
+        return;
+    }
+    if (isBroadcastMsg) {
+        registrarLog(`${logPrefix} [IGNORADO] Motivo: Mensagem de status/broadcast.`);
         return;
     }
     if (isNewsletterMsg) {

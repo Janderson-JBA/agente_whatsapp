@@ -64,6 +64,14 @@ function estaNaBlacklist(chatId, blacklistNormalizada) {
     return blacklistNormalizada.includes(idNormalizado);
 }
 
+function carregarSystemInstruction() {
+    try {
+        return fs.readFileSync('regras.txt', 'utf8').replace(/\r/g, '').trim();
+    } catch (erroRegras) {
+        return '';
+    }
+}
+
 function obterHistoricoDoChat(chatId) {
     if (!chatHistory.has(chatId)) {
         chatHistory.set(chatId, []);
@@ -95,10 +103,13 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
                 model: nomeModelo
             });
 
-            const chat = model.startChat({
-                history: obterHistoricoDoChat(chatId),
-                systemInstruction
-            });
+            const history = obterHistoricoDoChat(chatId);
+            const chat = systemInstruction
+                ? model.startChat({
+                    history,
+                    systemInstruction
+                })
+                : model.startChat({ history });
 
             const result = await chat.sendMessage(prompt);
             registrarLog(`${logPrefix} ✅ Modelo Gemini em uso: ${nomeModelo}`);
@@ -106,6 +117,26 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
         } catch (erroModelo) {
             ultimoErro = erroModelo;
             const eh404 = erroModelo?.status === 404;
+            const ehErroSystemInstruction = String(erroModelo?.message || '').includes('system_instruction');
+
+            if (ehErroSystemInstruction && systemInstruction) {
+                registrarLog(`${logPrefix} ⚠️ systemInstruction rejeitado pelo Gemini. Tentando sem regras embutidas...`, erroModelo);
+                try {
+                    const model = genAI.getGenerativeModel({
+                        model: nomeModelo
+                    });
+
+                    const chatSemSystemInstruction = model.startChat({
+                        history: obterHistoricoDoChat(chatId)
+                    });
+
+                    const resultSemSystemInstruction = await chatSemSystemInstruction.sendMessage(prompt);
+                    registrarLog(`${logPrefix} ✅ Modelo Gemini em uso sem systemInstruction: ${nomeModelo}`);
+                    return resultSemSystemInstruction.response.text();
+                } catch (erroFallbackSistema) {
+                    ultimoErro = erroFallbackSistema;
+                }
+            }
 
             if (eh404) {
                 registrarLog(`${logPrefix} ⚠️ Modelo indisponível (404): ${nomeModelo}. Tentando próximo...`);
@@ -137,11 +168,9 @@ async function processarFilaDoChat(chatId) {
     let chat = null;
 
     try {
-        let systemInstruction = '';
-        try {
-            systemInstruction = fs.readFileSync('regras.txt', 'utf8');
-        } catch (erroRegras) {
-            registrarLog(`${logPrefix} ⚠️ Aviso: Arquivo regras.txt não encontrado ou erro na leitura. O bot usará o prompt vazio.`, erroRegras);
+        const systemInstruction = carregarSystemInstruction();
+        if (!systemInstruction) {
+            registrarLog(`${logPrefix} ⚠️ Aviso: regras.txt vazio ou indisponível. O bot seguirá sem instruções fixas.`);
         }
 
         try {

@@ -94,6 +94,27 @@ function adicionarAoHistorico(chatId, role, texto) {
     return historico;
 }
 
+function limparRespostaGemini(texto) {
+    const bruto = String(texto || '').trim();
+    if (!bruto) {
+        return '';
+    }
+
+    const linhas = bruto
+        .split(/\r?\n+/)
+        .map((linha) => linha.trim())
+        .filter(Boolean);
+
+    const linhasLimpa = [];
+    for (const linha of linhas) {
+        if (linhasLimpa[linhasLimpa.length - 1] !== linha) {
+            linhasLimpa.push(linha);
+        }
+    }
+
+    return linhasLimpa.join('\n').trim();
+}
+
 async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix) {
     let ultimoErro = null;
 
@@ -112,8 +133,9 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
                 : model.startChat({ history });
 
             const result = await chat.sendMessage(prompt);
+            const respostaLimpa = limparRespostaGemini(result.response.text());
             registrarLog(`${logPrefix} ✅ Modelo Gemini em uso: ${nomeModelo}`);
-            return result.response.text();
+            return respostaLimpa;
         } catch (erroModelo) {
             ultimoErro = erroModelo;
             const eh404 = erroModelo?.status === 404;
@@ -131,8 +153,9 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
                     });
 
                     const resultSemSystemInstruction = await chatSemSystemInstruction.sendMessage(prompt);
+                    const respostaLimpa = limparRespostaGemini(resultSemSystemInstruction.response.text());
                     registrarLog(`${logPrefix} ✅ Modelo Gemini em uso sem systemInstruction: ${nomeModelo}`);
-                    return resultSemSystemInstruction.response.text();
+                    return respostaLimpa;
                 } catch (erroFallbackSistema) {
                     ultimoErro = erroFallbackSistema;
                 }
@@ -194,6 +217,10 @@ async function processarFilaDoChat(chatId) {
         adicionarAoHistorico(chatId, 'user', textoMensagemUsuario);
 
         const respostaGemini = await gerarRespostaGemini(chatId, textoMensagemUsuario, systemInstruction, logPrefix);
+
+        if (!respostaGemini) {
+            throw new Error('Resposta vazia após limpeza de duplicações.');
+        }
 
         adicionarAoHistorico(chatId, 'model', respostaGemini);
 

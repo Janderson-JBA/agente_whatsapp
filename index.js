@@ -6,12 +6,14 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // Inicializa o Gemini com a sua chave
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Fila de modelos otimizada para custo zero/baixo e alta velocidade
 const MODELOS_GEMINI_CANDIDATOS = [
     'gemini-flash-lite-latest',
     'gemini-flash-latest',
+    'gemini-2.5-flash-lite',
+    'gemini-2-flash-lite',
     'gemini-3.5-flash-lite',
-    'gemini-3.5-flash',
-    'gemini-pro-latest'
+    'gemini-3.1-flash-lite'   
 ];
 const DEBOUNCE_MS = 8000;
 const LOG_FILE_PATH = 'mensagens_log.txt';
@@ -19,6 +21,7 @@ const BLACKLIST_FILE_PATH = 'blacklist.txt';
 
 let botStartTime = 0;
 const filasPorChat = new Map();
+const chatHistory = new Map();
 
 function registrarLog(mensagem, erro = null) {
     const dataHora = new Date().toLocaleString('pt-BR');
@@ -39,24 +42,65 @@ function carregarBlacklist() {
         return conteudo
             .split(/\r?\n/)
             .map((linha) => linha.trim())
-            .filter((linha) => linha && !linha.startsWith('#'));
+            .filter((linha) => linha && !linha.startsWith('#'))
+            .map(normalizarIdentificadorChat);
     } catch (erro) {
         registrarLog('⚠️ Não foi possível ler blacklist.txt. Prosseguindo sem bloqueios da blacklist.', erro);
         return [];
     }
 }
 
-async function gerarRespostaGemini(prompt, systemInstruction, logPrefix) {
+function normalizarIdentificadorChat(valor) {
+    const texto = String(valor || '').trim();
+    if (!texto) {
+        return '';
+    }
+
+    return texto.split('@')[0].replace(/\D/g, '');
+}
+
+function estaNaBlacklist(chatId, blacklistNormalizada) {
+    const idNormalizado = normalizarIdentificadorChat(chatId);
+    return blacklistNormalizada.includes(idNormalizado);
+}
+
+function obterHistoricoDoChat(chatId) {
+    if (!chatHistory.has(chatId)) {
+        chatHistory.set(chatId, []);
+    }
+
+    return chatHistory.get(chatId);
+}
+
+function adicionarAoHistorico(chatId, role, texto) {
+    const historico = obterHistoricoDoChat(chatId);
+    historico.push({
+        role,
+        parts: [{ text: texto }]
+    });
+
+    if (historico.length > 10) {
+        historico.splice(0, 2);
+    }
+
+    return historico;
+}
+
+async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix) {
     let ultimoErro = null;
 
     for (const nomeModelo of MODELOS_GEMINI_CANDIDATOS) {
         try {
             const model = genAI.getGenerativeModel({
-                model: nomeModelo,
-                systemInstruction: systemInstruction
+                model: nomeModelo
             });
 
-            const result = await model.generateContent(prompt);
+            const chat = model.startChat({
+                history: obterHistoricoDoChat(chatId),
+                systemInstruction
+            });
+
+            const result = await chat.sendMessage(prompt);
             registrarLog(`${logPrefix} ✅ Modelo Gemini em uso: ${nomeModelo}`);
             return result.response.text();
         } catch (erroModelo) {
@@ -75,14 +119,6 @@ async function gerarRespostaGemini(prompt, systemInstruction, logPrefix) {
     throw ultimoErro;
 }
 
-function formatarLinhaContexto(msg) {
-    const texto = (msg.body || '').trim();
-    if (!texto) {
-        return null;
-    }
-    return `${msg.fromMe ? 'Bot disse' : 'Usuário disse'}: ${texto}`;
-}
-
 async function processarFilaDoChat(chatId) {
     const fila = filasPorChat.get(chatId);
     if (!fila || fila.mensagens.length === 0) {
@@ -99,7 +135,6 @@ async function processarFilaDoChat(chatId) {
     const logPrefix = `[CID:${correlationId}]`;
 
     let chat = null;
-    let linhasHistorico = [];
 
     try {
         let systemInstruction = '';
@@ -111,31 +146,27 @@ async function processarFilaDoChat(chatId) {
 
         try {
             chat = await msgBase.getChat();
-            const historicoBruto = await chat.fetchMessages({ limit: 8 });
-            const historicoOrdenado = [...historicoBruto].reverse();
-
-            linhasHistorico = historicoOrdenado
-                .map(formatarLinhaContexto)
-                .filter(Boolean);
         } catch (erroHistorico) {
-            registrarLog(`${logPrefix} ⚠️ Não foi possível carregar contexto do chat via getChat/fetchMessages. Seguindo apenas com mensagens da fila.`, erroHistorico);
+            registrarLog(`${logPrefix} ⚠️ Não foi possível obter o chat via getChat. Seguindo com histórico em memória.`, erroHistorico);
             chat = null;
-            linhasHistorico = [];
         }
 
         const linhasNovasMensagens = mensagensPendentes
             .map((m) => (m.body || '').trim())
             .filter(Boolean)
-            .map((texto) => `Usuário disse: ${texto}`);
+            .map((texto) => texto);
 
-        const contextoCompleto = [
-            'Contexto das últimas mensagens:',
-            ...(linhasHistorico.length ? linhasHistorico : ['Sem histórico disponível no momento.']),
-            'Novas mensagens do usuário:',
-            ...linhasNovasMensagens
-        ].join('\n');
+        const textoMensagemUsuario = linhasNovasMensagens.join('\n').trim();
 
-        const respostaGemini = await gerarRespostaGemini(contextoCompleto, systemInstruction, logPrefix);
+        if (!textoMensagemUsuario) {
+            throw new Error('Mensagem do usuário vazia após o debounce.');
+        }
+
+        adicionarAoHistorico(chatId, 'user', textoMensagemUsuario);
+
+        const respostaGemini = await gerarRespostaGemini(chatId, textoMensagemUsuario, systemInstruction, logPrefix);
+
+        adicionarAoHistorico(chatId, 'model', respostaGemini);
 
         if (chat) {
             try {
@@ -214,7 +245,7 @@ client.on('message', async (message) => {
     const isGroupMsg = message.from.includes('@g.us');
     const isNewsletterMsg = message.from.includes('@newsletter');
     const ignoredNumbers = carregarBlacklist();
-    const isIgnoredNumber = ignoredNumbers.includes(message.from);
+    const isIgnoredNumber = estaNaBlacklist(message.from, ignoredNumbers);
     const correlationId = message?.id?._serialized || `${message.from}-${Date.now()}`;
     const logPrefix = `[CID:${correlationId}]`;
 

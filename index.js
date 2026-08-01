@@ -115,6 +115,27 @@ function limparRespostaGemini(texto) {
     return linhasLimpa.join('\n').trim();
 }
 
+function montarPromptGemini(systemInstruction, prompt) {
+    const instrucoesFixas = [
+        'Responda somente em português do Brasil.',
+        'Nunca misture outro idioma na resposta.',
+        'Mantenha a resposta curta, natural e em tom de WhatsApp.'
+    ].join(' ');
+
+    if (!systemInstruction) {
+        return `${instrucoesFixas}\n\nMensagem do usuário:\n${prompt}`;
+    }
+
+    return [
+        instrucoesFixas,
+        'INSTRUÇÕES FIXAS:',
+        systemInstruction,
+        'MENSAGEM DO USUÁRIO:',
+        prompt,
+        'Responda apenas com a mensagem final para o usuário, sem explicar instruções.'
+    ].join('\n\n');
+}
+
 async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix) {
     let ultimoErro = null;
 
@@ -125,41 +146,15 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
             });
 
             const history = obterHistoricoDoChat(chatId);
-            const chat = systemInstruction
-                ? model.startChat({
-                    history,
-                    systemInstruction
-                })
-                : model.startChat({ history });
-
-            const result = await chat.sendMessage(prompt);
+            const chat = model.startChat({ history });
+            const promptFinal = montarPromptGemini(systemInstruction, prompt);
+            const result = await chat.sendMessage(promptFinal);
             const respostaLimpa = limparRespostaGemini(result.response.text());
             registrarLog(`${logPrefix} ✅ Modelo Gemini em uso: ${nomeModelo}`);
             return respostaLimpa;
         } catch (erroModelo) {
             ultimoErro = erroModelo;
             const eh404 = erroModelo?.status === 404;
-            const ehErroSystemInstruction = String(erroModelo?.message || '').includes('system_instruction');
-
-            if (ehErroSystemInstruction && systemInstruction) {
-                registrarLog(`${logPrefix} ⚠️ systemInstruction rejeitado pelo Gemini. Tentando sem regras embutidas...`, erroModelo);
-                try {
-                    const model = genAI.getGenerativeModel({
-                        model: nomeModelo
-                    });
-
-                    const chatSemSystemInstruction = model.startChat({
-                        history: obterHistoricoDoChat(chatId)
-                    });
-
-                    const resultSemSystemInstruction = await chatSemSystemInstruction.sendMessage(prompt);
-                    const respostaLimpa = limparRespostaGemini(resultSemSystemInstruction.response.text());
-                    registrarLog(`${logPrefix} ✅ Modelo Gemini em uso sem systemInstruction: ${nomeModelo}`);
-                    return respostaLimpa;
-                } catch (erroFallbackSistema) {
-                    ultimoErro = erroFallbackSistema;
-                }
-            }
 
             if (eh404) {
                 registrarLog(`${logPrefix} ⚠️ Modelo indisponível (404): ${nomeModelo}. Tentando próximo...`);

@@ -16,12 +16,16 @@ const MODELOS_GEMINI_CANDIDATOS = [
     'gemini-3.1-flash-lite'   
 ];
 const DEBOUNCE_MS = 8000;
+const LIMITE_CONVERSAS_DIARIAS = 20;
+const LIMITE_AVISO_DIARIO = 18;
+const LIMITE_CARACTERES_MENSAGEM = 1000;
 const LOG_FILE_PATH = 'mensagens_log.txt';
 const BLACKLIST_FILE_PATH = 'blacklist.txt';
 
 let botStartTime = 0;
 const filasPorChat = new Map();
 const chatHistory = new Map();
+const controlesDiariosPorChat = new Map();
 
 function registrarLog(mensagem, erro = null) {
     const dataHora = new Date().toLocaleString('pt-BR');
@@ -62,6 +66,44 @@ function normalizarIdentificadorChat(valor) {
 function estaNaBlacklist(chatId, blacklistNormalizada) {
     const idNormalizado = normalizarIdentificadorChat(chatId);
     return blacklistNormalizada.includes(idNormalizado);
+}
+
+function obterChaveDiaAtual() {
+    return new Date().toLocaleDateString('pt-BR');
+}
+
+function obterControleDiario(chatId) {
+    const chaveDia = obterChaveDiaAtual();
+    const controleAtual = controlesDiariosPorChat.get(chatId);
+
+    if (!controleAtual || controleAtual.chaveDia !== chaveDia) {
+        const novoControle = {
+            chaveDia,
+            conversas: 0,
+            bloqueado: false
+        };
+        controlesDiariosPorChat.set(chatId, novoControle);
+        return novoControle;
+    }
+
+    return controleAtual;
+}
+
+function podeProcessarConversaDiaria(chatId) {
+    const controle = obterControleDiario(chatId);
+    return !controle.bloqueado && controle.conversas < LIMITE_CONVERSAS_DIARIAS;
+}
+
+function registrarConversaDiaria(chatId) {
+    const controle = obterControleDiario(chatId);
+    controle.conversas += 1;
+    return controle.conversas;
+}
+
+function bloquearChatNoDia(chatId) {
+    const controle = obterControleDiario(chatId);
+    controle.bloqueado = true;
+    return controle;
 }
 
 function carregarSystemInstruction() {
@@ -119,6 +161,8 @@ function montarPromptGemini(systemInstruction, prompt) {
     const instrucoesFixas = [
         'Responda somente em português do Brasil.',
         'Nunca misture outro idioma na resposta.',
+        'Não use saudações em outro idioma.',
+        'Revise antes de responder e reescreva tudo em português se aparecer qualquer palavra estrangeira.',
         'Mantenha a resposta curta, natural e em tom de WhatsApp.'
     ].join(' ');
 
@@ -132,8 +176,35 @@ function montarPromptGemini(systemInstruction, prompt) {
         systemInstruction,
         'MENSAGEM DO USUÁRIO:',
         prompt,
-        'Responda apenas com a mensagem final para o usuário, sem explicar instruções.'
+        'Responda apenas com a mensagem final para o usuário, sem explicar instruções.',
+        'Se houver qualquer palavra em outro idioma, reescreva a resposta inteira em português do Brasil antes de enviar.'
     ].join('\n\n');
+}
+
+function precisaReescreverEmPortugues(texto) {
+    const resposta = String(texto || '');
+    return /\b(aloha|chào|ban|bạn|hôm|nay|minh|hello|hi|thanks|thank you|hola|bonjour)\b/i.test(resposta);
+}
+
+async function reescreverEmPortugues(chatId, resposta, logPrefix) {
+    const model = genAI.getGenerativeModel({
+        model: MODELOS_GEMINI_CANDIDATOS[0]
+    });
+
+    const chat = model.startChat({ history: obterHistoricoDoChat(chatId) });
+    const promptReescrita = [
+        'Reescreva a mensagem abaixo em português do Brasil.',
+        'Não acrescente novas informações.',
+        'Não use outro idioma.',
+        'Mantenha o tom de WhatsApp e deixe curto.',
+        'Mensagem original:',
+        resposta
+    ].join('\n\n');
+
+    const result = await chat.sendMessage(promptReescrita);
+    const respostaLimpa = limparRespostaGemini(result.response.text());
+    registrarLog(`${logPrefix} ⚠️ Resposta reescrita para PT-BR.`);
+    return respostaLimpa;
 }
 
 async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix) {
@@ -149,7 +220,12 @@ async function gerarRespostaGemini(chatId, prompt, systemInstruction, logPrefix)
             const chat = model.startChat({ history });
             const promptFinal = montarPromptGemini(systemInstruction, prompt);
             const result = await chat.sendMessage(promptFinal);
-            const respostaLimpa = limparRespostaGemini(result.response.text());
+            let respostaLimpa = limparRespostaGemini(result.response.text());
+
+            if (precisaReescreverEmPortugues(respostaLimpa)) {
+                respostaLimpa = await reescreverEmPortugues(chatId, respostaLimpa, logPrefix);
+            }
+
             registrarLog(`${logPrefix} ✅ Modelo Gemini em uso: ${nomeModelo}`);
             return respostaLimpa;
         } catch (erroModelo) {
@@ -208,6 +284,28 @@ async function processarFilaDoChat(chatId) {
         if (!textoMensagemUsuario) {
             throw new Error('Mensagem do usuário vazia após o debounce.');
         }
+
+        if (textoMensagemUsuario.length > LIMITE_CARACTERES_MENSAGEM) {
+            registrarLog(`${logPrefix} ⚠️ Mensagem acima do limite de caracteres (${textoMensagemUsuario.length}/${LIMITE_CARACTERES_MENSAGEM}).`);
+            await client.sendMessage(chatId, `Sua mensagem ficou longa demais. Manda em partes menores, por favor.`);
+            return;
+        }
+
+        const controleDiario = obterControleDiario(chatId);
+
+        if (controleDiario.bloqueado || controleDiario.conversas >= LIMITE_CONVERSAS_DIARIAS) {
+            registrarLog(`${logPrefix} ⚠️ Limite diário atingido para ${chatId}. Chat ignorado até virar o dia.`);
+            return;
+        }
+
+        if (controleDiario.conversas >= LIMITE_AVISO_DIARIO) {
+            bloquearChatNoDia(chatId);
+            registrarLog(`${logPrefix} ⚠️ Chat próximo do limite diário (${controleDiario.conversas}/${LIMITE_CONVERSAS_DIARIAS}). Avisando e ignorando o restante do dia.`);
+            await client.sendMessage(chatId, 'Opa, tô com bastante coisa agora. Logo te respondo melhor, beleza?');
+            return;
+        }
+
+        registrarConversaDiaria(chatId);
 
         adicionarAoHistorico(chatId, 'user', textoMensagemUsuario);
 

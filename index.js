@@ -26,6 +26,8 @@ let botStartTime = 0;
 const filasPorChat = new Map();
 const chatHistory = new Map();
 const controlesDiariosPorChat = new Map();
+const mutedChats = new Map();
+const botMessageIds = new Set();
 
 function registrarLog(mensagem, erro = null) {
     const dataHora = new Date().toLocaleString('pt-BR');
@@ -326,7 +328,13 @@ async function processarFilaDoChat(chatId) {
         }
 
         await new Promise((resolve) => setTimeout(resolve, 2500));
-        await client.sendMessage(chatId, respostaGemini);
+        const sentMsg = await client.sendMessage(chatId, respostaGemini);
+        if (sentMsg && sentMsg.id && sentMsg.id._serialized) {
+            botMessageIds.add(sentMsg.id._serialized);
+            setTimeout(() => {
+                botMessageIds.delete(sentMsg.id._serialized);
+            }, 120000); // Remove o ID do Set após 2 minutos para evitar vazamento de memória
+        }
         registrarLog(`${logPrefix} 🤖 Resposta do Gemini enviada com sucesso para ${chatId}.`);
     } catch (erroProcessamento) {
         registrarLog(`${logPrefix} ❌ Erro ao processar fila do chat ${chatId}:`, erroProcessamento);
@@ -388,8 +396,33 @@ client.on('ready', () => {
     registrarLog(`🕒 Filtro de inicialização ativo. botStartTime=${botStartTime}`);
 });
 
+// Evento disparado para todas as mensagens criadas (enviadas por mim ou recebidas)
+client.on('message_create', async (message) => {
+    // Verifica se a mensagem foi enviada por mim (o usuário dono da conta)
+    // E garante que essa mensagem não foi disparada pelo próprio código do bot
+    if (message.fromMe && !botMessageIds.has(message.id._serialized)) {
+        const endOfDay = new Date();
+        endOfDay.setHours(23, 59, 59, 999);
+        const expirationTimestamp = endOfDay.getTime();
+        
+        mutedChats.set(message.to, expirationTimestamp);
+        registrarLog(`[Human Takeover] Mensagem enviada pelo humano para ${message.to}. Chat silenciado para o bot até ${new Date(expirationTimestamp).toLocaleString('pt-BR')}.`);
+    }
+});
+
 // Evento disparado ao receber qualquer mensagem
 client.on('message', async (message) => {
+    // Verifica se o chat está pausado devido ao Human Takeover
+    const expiration = mutedChats.get(message.from);
+    if (expiration) {
+        if (Date.now() < expiration) {
+            registrarLog(`[Pausa/Human Takeover] Chat ${message.from} ignorado/silenciado temporariamente.`);
+            return;
+        } else {
+            mutedChats.delete(message.from);
+        }
+    }
+
     // No whatsapp-web.js, grupos terminam com '@g.us'
     const isGroupMsg = message.from.includes('@g.us');
     const isBroadcastMsg = message.from.includes('@broadcast');

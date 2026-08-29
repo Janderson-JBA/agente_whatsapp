@@ -11,15 +11,21 @@
 
 # Dados e logs dos testes...
 mensagens_log.txt
+recep_log.txt
 blacklist.txt
 regras.txt
+regras_recep.txt
 *.log
 
 # Dependências e autenticação
 node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
+.wwebjs_cache.backup-*/
 
 # Configurações locais
 .vscode/
 .DS_Store
+
+# Anotações pessoais locais
+comanos.txt

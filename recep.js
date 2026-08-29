@@ -15,13 +15,13 @@ const MODELOS_GEMINI_CANDIDATOS = [
     'gemini-2.5-flash-lite',
     'gemini-2-flash-lite',
     'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite'   
+    'gemini-3.1-flash-lite'
 ];
 const DEBOUNCE_MS = 4000;
 const LIMITE_CONVERSAS_DIARIAS = 25;
 const LIMITE_AVISO_DIARIO = 18;
 const LIMITE_CARACTERES_MENSAGEM = 1000;
-const LOG_FILE_PATH = 'mensagens_log.txt';
+const LOG_FILE_PATH = 'recep_log.txt';
 const BLACKLIST_FILE_PATH = 'blacklist.txt';
 
 let botStartTime = 0;
@@ -34,7 +34,10 @@ const botSendingChats = new Set();
 
 // Controle de anti-spam: evita reenviar notificação enquanto a conversa aguarda intervenção humana.
 const notificacoesPendentesPorChat = new Map();
-const MARCADOR_NOTIFICACAO_REGEX = /\s*\[NOTIFICAR_JANDERSON(?:\s*:\s*([^\]]*))?\]\s*/i;
+// Controle de anti-spam: evita enviar o e-mail de confirmação de reserva mais de uma vez por chat.
+const reservasConfirmadasPorChat = new Map();
+const MARCADOR_NOTIFICACAO_REGEX = /\s*\[NOTIFICAR_RECEPCAO(?:\s*:\s*([^\]]*))?\]\s*/i;
+const MARCADOR_RESERVA_REGEX = /\s*\[RESERVA_CONFIRMADA\s*:\s*(\{[^\]]*\})\s*\]\s*/i;
 let transporterEmail = null;
 
 function registrarLog(mensagem, erro = null) {
@@ -118,7 +121,7 @@ function bloquearChatNoDia(chatId) {
 
 function carregarSystemInstruction() {
     try {
-        return fs.readFileSync('regras.txt', 'utf8').replace(/\r/g, '').trim();
+        return fs.readFileSync('regras_recep.txt', 'utf8').replace(/\r/g, '').trim();
     } catch (erroRegras) {
         return '';
     }
@@ -202,7 +205,7 @@ function limparRespostaGemini(texto) {
     return linhasLimpa.join('\n').trim();
 }
 
-// Extrai o marcador interno [NOTIFICAR_JANDERSON] / [NOTIFICAR_JANDERSON: motivo] e remove do texto final.
+// Extrai o marcador interno [NOTIFICAR_RECEPCAO] / [NOTIFICAR_RECEPCAO: motivo] e remove do texto final.
 function extrairNotificacao(texto) {
     const bruto = String(texto || '');
     const match = bruto.match(MARCADOR_NOTIFICACAO_REGEX);
@@ -217,13 +220,35 @@ function extrairNotificacao(texto) {
     return { textoLimpo, deveNotificar: true, motivo };
 }
 
+// Extrai o marcador interno [RESERVA_CONFIRMADA: {json}], validando o JSON e removendo do texto final.
+function extrairReservaConfirmada(texto) {
+    const bruto = String(texto || '');
+    const match = bruto.match(MARCADOR_RESERVA_REGEX);
+
+    if (!match) {
+        return { textoLimpo: bruto.trim(), reserva: null };
+    }
+
+    const textoLimpo = bruto.replace(MARCADOR_RESERVA_REGEX, ' ').trim();
+
+    let reserva = null;
+    try {
+        reserva = JSON.parse(match[1]);
+    } catch (erroJson) {
+        registrarLog('⚠️ Marcador de reserva encontrado, mas com JSON inválido. Ignorando envio de e-mail.', erroJson);
+        return { textoLimpo, reserva: null };
+    }
+
+    return { textoLimpo, reserva };
+}
+
 const PADRAO_INFORMACAO_SENSIVEL = /senha|password|token|api\s*key|api_key|chave de acesso|credencial|cart[aã]o de cr[eé]dito|cvv/i;
 
 function contemInformacaoSensivel(texto) {
     return PADRAO_INFORMACAO_SENSIVEL.test(String(texto || ''));
 }
 
-const PADRAO_URGENCIA = /urgente|urg[eê]ncia|imediat|parou|parado|sistema fora do ar|perdi (os )?dados|perda de dados|n[aã]o pode esperar/i;
+const PADRAO_URGENCIA = /urgente|urg[eê]ncia|imediat|reclama[cç][aã]o|problema grave|acidente|emerg[eê]ncia/i;
 
 function ehUrgente(...textos) {
     return textos.some((texto) => PADRAO_URGENCIA.test(String(texto || '')));
@@ -252,8 +277,8 @@ function escaparHtml(texto) {
         .replace(/>/g, '&gt;');
 }
 
-// Envia a notificação por e-mail para o Janderson; nunca derruba o processamento do WhatsApp em caso de falha.
-async function enviarNotificacaoJanderson({ chatId, nomeContato, mensagemUsuario, respostaIA, motivo, urgente, logPrefix }) {
+// Envia a notificação por e-mail para a recepção; nunca derruba o processamento do WhatsApp em caso de falha.
+async function enviarNotificacaoRecepcao({ chatId, nomeContato, mensagemUsuario, respostaIA, motivo, urgente, logPrefix }) {
     if (notificacoesPendentesPorChat.has(chatId)) {
         registrarLog(`${logPrefix} [Notificação] ⚠️ Notificação já enviada para ${chatId}. Evitando duplicação.`);
         return;
@@ -264,7 +289,7 @@ async function enviarNotificacaoJanderson({ chatId, nomeContato, mensagemUsuario
 
     const contemDadoSensivel = contemInformacaoSensivel(mensagemUsuario) || contemInformacaoSensivel(respostaIA);
     const mensagemParaEmail = contemDadoSensivel
-        ? 'O contato enviou uma informação sensível que requer atenção (não exibida por segurança).'
+        ? 'O hóspede enviou uma informação sensível que requer atenção (não exibida por segurança).'
         : mensagemUsuario;
     const respostaParaEmail = contemDadoSensivel && contemInformacaoSensivel(respostaIA)
         ? 'Resposta omitida por conter possível informação sensível.'
@@ -272,31 +297,72 @@ async function enviarNotificacaoJanderson({ chatId, nomeContato, mensagemUsuario
 
     const dataHora = new Date().toLocaleString('pt-BR');
     const assunto = urgente
-        ? `[WhatsApp] URGENTE - ${nomeContato}`
-        : `[WhatsApp] Atenção necessária - ${nomeContato}`;
+        ? `[Recepção] URGENTE - ${nomeContato}`
+        : `[Recepção] Atenção necessária - ${nomeContato}`;
 
     const html = `
-        <h2>ATENÇÃO NECESSÁRIA</h2>
+        <h2>ATENÇÃO NECESSÁRIA NA RECEPÇÃO</h2>
         <p><strong>Contato:</strong><br>${escaparHtml(nomeContato)}</p>
         <p><strong>WhatsApp:</strong><br>${escaparHtml(chatId)}</p>
         <p><strong>Data/Hora:</strong><br>${escaparHtml(dataHora)}</p>
         <p><strong>Motivo:</strong><br>${escaparHtml(motivo || 'Não especificado pela IA')}</p>
         <p><strong>Mensagem recebida:</strong><br>"${escaparHtml(mensagemParaEmail)}"</p>
         <p><strong>Resposta enviada pela IA:</strong><br>"${escaparHtml(respostaParaEmail)}"</p>
-        <p><strong>Status:</strong><br>Aguardando intervenção do Janderson</p>
+        <p><strong>Status:</strong><br>Aguardando intervenção de um atendente humano</p>
     `;
 
     try {
         const transporter = obterTransportadorEmail();
         await transporter.sendMail({
-            from: `"Agente WhatsApp" <${process.env.SMTP_FROM}>`,
-            to: process.env.NOTIFICATION_EMAIL,
+            from: `"Recepção do Hotel" <${process.env.SMTP_FROM}>`,
+            to: process.env.RECEPCAO_NOTIFICATION_EMAIL || process.env.NOTIFICATION_EMAIL,
             subject: assunto,
             html
         });
-        registrarLog(`${logPrefix} [Notificação] 📧 E-mail enviado com sucesso para ${process.env.NOTIFICATION_EMAIL}`);
+        registrarLog(`${logPrefix} [Notificação] 📧 E-mail de atenção enviado com sucesso.`);
     } catch (erroEmail) {
         registrarLog(`${logPrefix} [Notificação] ❌ Falha ao enviar e-mail:`, erroEmail);
+    }
+}
+
+// Envia o e-mail de confirmação de reserva; só é chamado depois que o hóspede aceita explicitamente.
+async function enviarEmailReserva({ chatId, nomeContato, reserva, logPrefix }) {
+    if (reservasConfirmadasPorChat.has(chatId)) {
+        registrarLog(`${logPrefix} [Reserva] ⚠️ E-mail de reserva já enviado para ${chatId}. Evitando duplicação.`);
+        return;
+    }
+
+    reservasConfirmadasPorChat.set(chatId, Date.now());
+    registrarLog(`${logPrefix} [Reserva] 🔔 Reserva confirmada pelo hóspede: ${chatId}`);
+
+    const dataHora = new Date().toLocaleString('pt-BR');
+    const assunto = `[Reserva Confirmada] ${reserva.nome || nomeContato}`;
+
+    const html = `
+        <h2>NOVA RESERVA CONFIRMADA</h2>
+        <p><strong>Contato:</strong><br>${escaparHtml(nomeContato)}</p>
+        <p><strong>WhatsApp:</strong><br>${escaparHtml(chatId)}</p>
+        <p><strong>Data/Hora da confirmação:</strong><br>${escaparHtml(dataHora)}</p>
+        <p><strong>Nome completo:</strong><br>${escaparHtml(reserva.nome)}</p>
+        <p><strong>CPF:</strong><br>${escaparHtml(reserva.cpf)}</p>
+        <p><strong>Check-in:</strong><br>${escaparHtml(reserva.checkin)}</p>
+        <p><strong>Check-out:</strong><br>${escaparHtml(reserva.checkout)}</p>
+        <p><strong>Tipo de quarto:</strong><br>${escaparHtml(reserva.tipo_quarto)}</p>
+        <p><strong>Valor da diária:</strong><br>${escaparHtml(reserva.valor_diaria)}</p>
+        <p><strong>Observações:</strong><br>${escaparHtml(reserva.observacoes || 'Nenhuma')}</p>
+    `;
+
+    try {
+        const transporter = obterTransportadorEmail();
+        await transporter.sendMail({
+            from: `"Recepção do Hotel" <${process.env.SMTP_FROM}>`,
+            to: process.env.RECEPCAO_NOTIFICATION_EMAIL || process.env.NOTIFICATION_EMAIL,
+            subject: assunto,
+            html
+        });
+        registrarLog(`${logPrefix} [Reserva] 📧 E-mail de confirmação de reserva enviado com sucesso.`);
+    } catch (erroEmail) {
+        registrarLog(`${logPrefix} [Reserva] ❌ Falha ao enviar e-mail de reserva:`, erroEmail);
     }
 }
 
@@ -306,7 +372,7 @@ function montarPromptGemini(systemInstruction, prompt) {
         'Nunca misture outro idioma na resposta.',
         'Não use saudações em outro idioma.',
         'Revise antes de responder e reescreva tudo em português se aparecer qualquer palavra estrangeira.',
-        'Mantenha a resposta curta, natural e em tom de WhatsApp.'
+        'Mantenha a resposta curta, cordial e em tom de recepção de hotel.'
     ].join(' ');
 
     if (!systemInstruction) {
@@ -339,7 +405,7 @@ async function reescreverEmPortugues(chatId, resposta, logPrefix) {
         'Reescreva a mensagem abaixo em português do Brasil.',
         'Não acrescente novas informações.',
         'Não use outro idioma.',
-        'Mantenha o tom de WhatsApp e deixe curto.',
+        'Mantenha o tom de recepção de hotel e deixe curto.',
         'Mensagem original:',
         resposta
     ].join('\n\n');
@@ -426,7 +492,7 @@ async function processarFilaDoChat(chatId) {
     try {
         const systemInstruction = carregarSystemInstruction();
         if (!systemInstruction) {
-            registrarLog(`${logPrefix} ⚠️ Aviso: regras.txt vazio ou indisponível. O bot seguirá sem instruções fixas.`);
+            registrarLog(`${logPrefix} ⚠️ Aviso: regras_recep.txt vazio ou indisponível. O bot seguirá sem instruções fixas.`);
         }
 
         try {
@@ -453,7 +519,7 @@ async function processarFilaDoChat(chatId) {
 
         if (textoMensagemUsuario.length > LIMITE_CARACTERES_MENSAGEM) {
             registrarLog(`${logPrefix} ⚠️ Mensagem acima do limite de caracteres (${textoMensagemUsuario.length}/${LIMITE_CARACTERES_MENSAGEM}).`);
-            await client.sendMessage(chatId, `Sua mensagem ficou longa demais. Manda em partes menores, por favor.`);
+            await client.sendMessage(chatId, `Sua mensagem ficou longa demais. Pode me enviar em partes menores, por favor?`);
             return;
         }
 
@@ -467,7 +533,7 @@ async function processarFilaDoChat(chatId) {
         if (controleDiario.conversas >= LIMITE_AVISO_DIARIO) {
             bloquearChatNoDia(chatId);
             registrarLog(`${logPrefix} ⚠️ Chat próximo do limite diário (${controleDiario.conversas}/${LIMITE_CONVERSAS_DIARIAS}). Avisando e ignorando o restante do dia.`);
-            await enviarMensagemDoBot(chatId, 'Beleza, por hoje já anotei bastante coisa. Te chamo em breve.');
+            await enviarMensagemDoBot(chatId, 'Por hoje já registrei bastante coisa por aqui. Em breve alguém da recepção continua o atendimento.');
             return;
         }
 
@@ -481,24 +547,32 @@ async function processarFilaDoChat(chatId) {
             throw new Error('Resposta vazia após limpeza de duplicações.');
         }
 
-        const { textoLimpo: respostaLimpaFinal, deveNotificar, motivo } = extrairNotificacao(respostaGemini);
+        const { textoLimpo: textoSemReserva, reserva } = extrairReservaConfirmada(respostaGemini);
+        const { textoLimpo: respostaLimpaFinal, deveNotificar, motivo } = extrairNotificacao(textoSemReserva);
 
         if (!respostaLimpaFinal) {
-            throw new Error('Resposta vazia após remover marcador de notificação.');
+            throw new Error('Resposta vazia após remover marcadores internos.');
         }
 
         adicionarAoHistorico(chatId, 'model', respostaLimpaFinal);
 
-        if (deveNotificar) {
-            let nomeContato = chatId;
+        let nomeContato = chatId;
+        if (deveNotificar || reserva) {
             try {
                 const contato = await msgBase.getContact();
                 nomeContato = contato?.pushname || contato?.name || contato?.number || chatId;
             } catch (erroContato) {
-                registrarLog(`${logPrefix} ⚠️ Não foi possível obter o nome do contato para a notificação. Usando o ID do chat.`, erroContato);
+                registrarLog(`${logPrefix} ⚠️ Não foi possível obter o nome do contato. Usando o ID do chat.`, erroContato);
             }
+        }
 
-            await enviarNotificacaoJanderson({
+        // O e-mail de reserva só é enviado quando o hóspede confirma explicitamente todos os dados.
+        if (reserva) {
+            await enviarEmailReserva({ chatId, nomeContato, reserva, logPrefix });
+        }
+
+        if (deveNotificar) {
+            await enviarNotificacaoRecepcao({
                 chatId,
                 nomeContato,
                 mensagemUsuario: textoMensagemUsuario,
@@ -523,7 +597,7 @@ async function processarFilaDoChat(chatId) {
     } catch (erroProcessamento) {
         registrarLog(`${logPrefix} ❌ Erro ao processar fila do chat ${chatId}:`, erroProcessamento);
         try {
-            await enviarMensagemDoBot(chatId, 'Desculpe, não consegui processar sua mensagem agora. Pode tentar de novo em instantes?');
+            await enviarMensagemDoBot(chatId, 'Desculpe, não consegui processar sua mensagem agora. Pode tentar novamente em instantes?');
         } catch (erroEnvioFallback) {
             registrarLog(`${logPrefix} ❌ Erro ao enviar mensagem de fallback após falha no processamento:`, erroEnvioFallback);
         }
@@ -546,11 +620,11 @@ async function processarFilaDoChat(chatId) {
     }
 }
 
-registrarLog('🚀 Iniciando o whatsapp-web.js e conectando ao WhatsApp...');
+registrarLog('🚀 Iniciando o whatsapp-web.js (recepção) e conectando ao WhatsApp...');
 
-// Configuração do whatsapp-web.js com LocalAuth para salvar a sessão no disco
+// Configuração do whatsapp-web.js com LocalAuth para salvar a sessão no disco (clientId próprio, separado do index.js)
 const client = new Client({
-    authStrategy: new LocalAuth({ clientId: 'agente-janderson' }),
+    authStrategy: new LocalAuth({ clientId: 'agente-recepcao' }),
     authTimeoutMs: 120000,
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.31 Safari/537.36',
     webVersion: '2.3000.1045828994-alpha',
@@ -586,7 +660,7 @@ client.on('qr', (qr) => {
 // Evento disparado quando o bot se conecta com sucesso e está pronto
 client.on('ready', () => {
     botStartTime = Math.floor(Date.now() / 1000);
-    registrarLog('✅ WhatsApp Conectado! O agente está pronto para ouvir mensagens!');
+    registrarLog('✅ WhatsApp Conectado! A recepção virtual está pronta para atender!');
     registrarLog(`🕒 Filtro de inicialização ativo. botStartTime=${botStartTime}`);
     registrarLog(`👤 Conta conectada: ${client.info?.wid?._serialized || 'não identificada'}`);
 });
@@ -620,19 +694,18 @@ const manterProcessoAtivo = setInterval(() => {}, 60 * 60 * 1000);
 client.on('message_create', async (message) => {
     registrarLog(`[RAW] Mensagem ${message.fromMe ? 'de saída' : 'de entrada'} | De: ${message.from} | Para: ${message.to} | Tipo: ${message.type} | Texto: ${message.body || '[sem texto]'}`);
 
-    // Verifica se a mensagem foi enviada por mim (o usuário dono da conta)
+    // Verifica se a mensagem foi enviada por mim (atendente humano da recepção)
     // E garante que essa mensagem não foi disparada pelo próprio código do bot
-    // (botSendingChats cobre o intervalo entre o início do envio e a confirmação do ID)
     if (message.fromMe && !botMessageIds.has(message.id._serialized) && !botSendingChats.has(message.to)) {
         const endOfDay = new Date();
         endOfDay.setHours(23, 59, 59, 999);
         const expirationTimestamp = endOfDay.getTime();
-        
+
         mutedChats.set(message.to, expirationTimestamp);
         registrarLog(`[Human Takeover] Mensagem enviada pelo humano para ${message.to}. Chat silenciado para o bot até ${new Date(expirationTimestamp).toLocaleString('pt-BR')}.`);
 
         if (notificacoesPendentesPorChat.delete(message.to)) {
-            registrarLog(`[Notificação] ✅ Pendência de notificação resetada para ${message.to} (Janderson respondeu manualmente).`);
+            registrarLog(`[Notificação] ✅ Pendência de notificação resetada para ${message.to} (atendente respondeu manualmente).`);
         }
     }
 });
@@ -660,8 +733,8 @@ client.on('message', async (message) => {
     const logPrefix = `[CID:${correlationId}]`;
 
     registrarLog(`${logPrefix} Nova mensagem recebida | De: ${message.from} | Grupo: ${isGroupMsg} | Tipo: ${message.type} | Texto: ${message.body}`);
-    
-    // 6. Filtro rigoroso com explicações no terminal
+
+    // Filtro rigoroso com explicações no terminal
     if (isGroupMsg) {
         registrarLog(`${logPrefix} [IGNORADO] Motivo: A mensagem veio de um grupo.`);
         return;
